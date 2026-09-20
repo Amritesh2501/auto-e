@@ -4,7 +4,6 @@ import queue
 import threading
 import time
 from collections import Counter, deque
-from ctypes import wintypes
 
 import auto_e as a
 
@@ -70,24 +69,18 @@ assert ctypes.sizeof(a.INPUT) == ctypes.sizeof(a.MOUSEINPUT) + 8, ctypes.sizeof(
 assert a.INPUT.mi.offset == a.INPUT.ki.offset
 
 
-def cursor():
-    pt = wintypes.POINT()
-    a.user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x, pt.y
-
-
-home = cursor()
-# away from the screen edges: a move that clips against one can't come back symmetrically (that only shifts
-# the desktop pointer, never the camera, which follows the relative delta)
-a.user32.SetCursorPos(400, 400)
-before = cursor()
+home = a.cursor_at()
+a.user32.SetCursorPos(400, 400)   # away from the screen edges, where a move would clip
+before = a.cursor_at()
 a.move_mouse(7, 6)
-moved = cursor()
-a.move_mouse(-7, -6)
+moved = a.cursor_at()
 assert moved != before, "the mouse never moved: SendInput rejected the mouse INPUT"
-assert cursor() == before, f"the nudge drifted: {before} -> {cursor()}"
+a.user32.SetCursorPos(*before)
+for _ in range(5):                # pointer acceleration is not symmetric, so this has to hold every time
+    a.nudge_mouse()
+    assert a.cursor_at() == before, f"the nudge drifted: {before} -> {a.cursor_at()}"
 a.user32.SetCursorPos(*home)
-print("ok: mouse nudge moved", moved, "and came back to", before)
+print("ok: mouse moved to", moved, "and 5 nudges left the pointer on", before)
 
 # a press aimed while watching, then queued, must not fire once watching has stopped -- otherwise the bar's
 # key lands in the chat box that the next step just opened

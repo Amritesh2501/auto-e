@@ -236,15 +236,37 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _U)]
 
 
+def cursor_at():
+    pt = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
 def cursor_in(hwnd):
     """True when the pointer is inside that window. A nudge must never drag a pointer you are using somewhere
     else, on a second monitor for instance."""
     if not hwnd:
         return True
-    pt, rect = wintypes.POINT(), wintypes.RECT()
-    if not (user32.GetCursorPos(ctypes.byref(pt)) and user32.GetWindowRect(hwnd, ctypes.byref(rect))):
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return True
-    return rect.left <= pt.x < rect.right and rect.top <= pt.y < rect.bottom
+    x, y = cursor_at()
+    return rect.left <= x < rect.right and rect.top <= y < rect.bottom
+
+
+def nudge_mouse():
+    """A few pixels and straight back: enough for an AFK check to see mouse input, and the same distance each
+    way so a game's camera lands where it started."""
+    dx, dy = random.choice(((7, 0), (-7, 0), (0, 6), (0, -6), (6, 5), (-6, -5)))
+    home = cursor_at()
+    move_mouse(dx, dy)
+    time.sleep(0.12)
+    move_mouse(-dx, -dy)
+    # "enhance pointer precision" scales a move by how fast it is, and the two moves are not equally fast, so
+    # they don't cancel to the pixel. Put the pointer back exactly: SetCursorPos is not input, so it neither
+    # counts against the AFK timer nor reaches the game.
+    user32.SetCursorPos(*home)
+    return dx, dy
 
 
 def move_mouse(dx, dy):
@@ -491,11 +513,7 @@ class Watcher(threading.Thread):
             if self.target and not cfg["background"] and user32.GetForegroundWindow() != self.target:
                 continue  # focus mode: the game isn't in front, so a nudge would go to whatever is
             self.last_jiggle = time.time()
-            dx, dy = random.choice(((7, 0), (-7, 0), (0, 6), (0, -6), (6, 5), (-6, -5)))
-            move_mouse(dx, dy)
-            time.sleep(0.12)
-            move_mouse(-dx, -dy)  # straight back, so the camera never drifts
-            log.debug(f"Mouse nudge {dx},{dy} and back")
+            log.debug(f"Mouse nudge {nudge_mouse()} and back")
 
     def run(self):
         frames, t_fps = 0, time.perf_counter()
