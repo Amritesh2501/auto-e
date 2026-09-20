@@ -88,13 +88,17 @@ def find_marks(bgr):
     thin = [i for i in blobs if st[i, 3] >= 2.5 * st[i, 2]]
     if thin:
         cand = max(thin, key=lambda i: st[i, 3])
-        others = [st[i, 3] for i in blobs if i != cand]
+        # only blobs about as narrow as the line can be mistaken for it. Bright world behind a see-through bar
+        # (sky, a wall, a light) makes wide blobs, and those used to veto the line -> no press while you look around.
+        others = [st[i, 3] for i in blobs if i != cand and st[i, 2] <= 3 * st[cand, 2]]
         if not others or st[cand, 3] >= 1.3 * max(others):  # a thin letter (I, 1) is shorter than the line
             line = cand
     rest = [i for i in blobs if i != line]
     line_x = int(cen[line][0]) if line is not None else None
     if line is not None:  # the letter sits at the line's height; bright bits of the world elsewhere don't count
         rest = [i for i in rest if st[line, 1] <= cen[i][1] <= st[line, 1] + st[line, 3]]
+    narrow = [i for i in rest if st[i, 2] <= 2.5 * st[i, 3]]  # a letter is never much wider than it is tall
+    rest = narrow or rest  # so a bright patch of world behind the bar can't win "biggest blob" and hide the letter
     if not rest:
         return line_x, None, None
     a = max(rest, key=lambda i: st[i, 4])
@@ -210,14 +214,15 @@ def recognize(mask, templates, min_score=0.75):
     return (char if score >= min_score else None), score
 
 
-def press_wait(land, vel, lo, hi, dt):
+def press_wait(land, vel, lo, hi, dt, horizon=None):
     """Seconds to wait before sending the key so it lands on the zone center, or None to leave it to a later check.
     land = where the line would be if the key were sent now (px), vel = line speed (px/s, signed), lo..hi = the
-    zone, dt = seconds between checks. Schedules the press once the next check might already be too late."""
+    zone, dt = seconds between checks, horizon = how far ahead a press may be booked (default: one and a half
+    checks, so a later, better-informed check normally gets the call)."""
     if vel < 0:  # mirror, so the line always travels left to right
         land, lo, hi = -land, -hi, -lo
     wait = ((lo + hi) / 2 - land) / abs(vel)
-    if wait > 1.5 * dt:  # checks come unevenly: leave a spare half check
+    if wait > (1.5 * dt if horizon is None else horizon):  # checks come unevenly: leave a spare half check
         return None
     return max(0.0, wait) if land <= hi else None  # past the center but still in the zone: now; past it: too late
 
@@ -225,6 +230,8 @@ def press_wait(land, vel, lo, hi, dt):
 if __name__ == "__main__":
     # press timing: zone 100-120 (center 110), 600 px/s, a check every 1/60 s (10 px)
     assert press_wait(85, 600, 100, 120, 1 / 60) is None  # 42 ms away: a later check schedules it
+    # a narrow zone the line crosses in less than one check: with a longer horizon it is booked from further out
+    assert abs(press_wait(85, 600, 100, 120, 1 / 60, 0.06) - 0.0416666) < 1e-5
     assert abs(press_wait(98, 600, 100, 120, 1 / 60) - 0.02) < 1e-9  # 20 ms: schedule it now
     assert press_wait(115, 600, 100, 120, 1 / 60) == 0.0  # past the center, still in the zone: press now
     assert press_wait(125, 600, 100, 120, 1 / 60) is None  # past the zone
@@ -282,6 +289,13 @@ if __name__ == "__main__":
     top = rank(mask, build_templates(fonts=[f for f in FONTS if f != "seguibl.ttf"]))
     print("skill bar:", line_x, letter_box, top)
     assert abs(line_x - 200) <= 2 and letter_box and 100 <= letter_box[0] <= 108 and top[0][0] == "E", top
+    # a bright patch of world behind the see-through bar (looking at the sky, a wall, a light) must not veto the
+    # line nor be taken for the letter -- that was every miss while the mouse moved
+    busy = skill.copy()
+    cv2.rectangle(busy, (250, 14), (340, 46), (255, 255, 255), -1)
+    line_x, letter_box, mask = find_marks(busy)
+    assert abs(line_x - 200) <= 2, f"bright background hid the line: {line_x}"
+    assert letter_box and 100 <= letter_box[0] <= 108, f"bright background taken for the letter: {letter_box}"
 
     # every letter drawn in one real font must be read using only the *other* fonts, both at a normal
     # size and small + extra heavy (Impact is skipped as held-out: too condensed to resemble anything else)

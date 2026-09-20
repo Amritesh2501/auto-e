@@ -5,6 +5,7 @@
 
 Developer menu: press and hold the "Auto E" title for 3 seconds.
 """
+import atexit
 import ctypes
 import json
 import logging
@@ -42,10 +43,23 @@ CONFIG = APP_DIR / "config.json"
 TRIGGERS = ["Line hits box", "Letter appears"]
 DEFAULTS = {
     "hotkey": "F8", "trigger": TRIGGERS[0], "margin": 10, "delay": 0, "aim_ms": 20, "hold": 50, "cooldown": 300,
-    "retries": 1, "retry_ms": 250, "focus_game": True, "background": False,
+    "retries": 1, "retry_ms": 250, "background": False, "jiggle": True, "jiggle_secs": 120,
     "min_conf": 75, "digits": False, "max_fps": 60,
     "minimize": True, "outline": True, "hide_capture": True, "hide_taskbar": False, "topmost": True,
     "dev": False, "verbose": False, "dry_run": False, "show_mask": False,
+    # the full-auto cycle, run top to bottom then round again. key = one key, or text to type (sent with
+    # Enter after it). wait = "bar" (until the bar's key is pressed) or a number of minutes. watch = keep
+    # reading the region during that wait.
+    "auto": [
+        {"on": True, "key": "E", "wait": "bar", "watch": True},
+        {"on": True, "key": "1", "wait": "5", "watch": True},
+        {"on": True, "key": "T", "wait": "0", "watch": False},
+        {"on": True, "key": "e yoga", "wait": "10", "watch": False},
+        {"on": True, "key": "X", "wait": "0", "watch": True},
+        {"on": False, "key": "", "wait": "0", "watch": True},
+        {"on": False, "key": "", "wait": "0", "watch": True},
+        {"on": False, "key": "", "wait": "0", "watch": True},
+    ],
     "skill": {"region": None, "key": "Auto"},
     "custom": {"region": None, "box": det.GYM["box"], "line": det.GYM["line"],
                "box_pixel": None, "line_pixel": None, "tolerance": 60},
@@ -146,6 +160,7 @@ user32.GetAncestor.restype = wintypes.HWND
 user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
 user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.SystemParametersInfoW.argtypes = (wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT)
 user32.BringWindowToTop.argtypes = user32.IsIconic.argtypes = (wintypes.HWND,)
 user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
 user32.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
@@ -196,23 +211,55 @@ def title_of(hwnd):
 
 
 # ---------- keyboard input ----------
+# keys with no printable character; everything else comes from the current keyboard layout
+VKS = {"Space": 0x20, "Enter": 0x0D, "Backspace": 0x08, "Tab": 0x09, "Esc": 0x1B}
+
+
+def vk_of(ch):
+    return VKS.get(ch) or user32.VkKeyScanW(ord(ch.lower())) & 0xFF
+
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
                 ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
 
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
 class INPUT(ctypes.Structure):
     class _U(ctypes.Union):
-        _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]  # pad = size of the biggest member
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("pad", ctypes.c_byte * 32)]  # pad = biggest member
     _anonymous_ = ("u",)
     _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+def cursor_in(hwnd):
+    """True when the pointer is inside that window. A nudge must never drag a pointer you are using somewhere
+    else, on a second monitor for instance."""
+    if not hwnd:
+        return True
+    pt, rect = wintypes.POINT(), wintypes.RECT()
+    if not (user32.GetCursorPos(ctypes.byref(pt)) and user32.GetWindowRect(hwnd, ctypes.byref(rect))):
+        return True
+    return rect.left <= pt.x < rect.right and rect.top <= pt.y < rect.bottom
+
+
+def move_mouse(dx, dy):
+    """A relative mouse move, as real input. SetCursorPos would warp the pointer without counting as input at
+    all, which is exactly what an AFK check looks for."""
+    inp = INPUT(type=0, mi=MOUSEINPUT(dx, dy, 0, 0x0001, 0, 0))  # INPUT_MOUSE, MOUSEEVENTF_MOVE
+    if not user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)):
+        say_once("sendinput_mouse", logging.ERROR, f"Mouse SendInput failed (error {ctypes.get_last_error()})", 10)
 
 
 def send_key(ch, hold):
     """Real key down, hold, key up, as a hardware scan code. Games reading DirectInput / raw input (GTA/FiveM,
     most engines) only see scan codes; Windows also turns it into normal key messages for browsers and apps.
     Holding matters: games that check keys once per frame miss 0ms taps."""
-    vk = 0x20 if ch == "Space" else user32.VkKeyScanW(ord(ch.lower())) & 0xFF
+    vk = vk_of(ch)
     scan = user32.MapVirtualKeyW(vk, 0)  # MAPVK_VK_TO_VSC, for the current keyboard layout
     for flags in (0x8, 0x8 | 0x2):  # KEYEVENTF_SCANCODE, then | KEYEVENTF_KEYUP
         inp = INPUT(type=1, ki=KEYBDINPUT(0, scan, flags, 0, 0))
@@ -222,20 +269,55 @@ def send_key(ch, hold):
             time.sleep(hold)
 
 
+_fg_timeout = None
+
+
+def unlock_foreground():
+    """Windows holds the foreground for the window you last used and refuses SetForegroundWindow to everyone
+    else, which is why presses stop landing the moment you alt-tab away from the game. A zero lock timeout
+    lifts that. Windows only accepts the change from the foreground window, so this runs when you press Start,
+    while the Auto E window still has focus. Nothing is written to the registry and the old value goes back
+    when the app closes."""
+    global _fg_timeout
+    val = ctypes.c_uint()
+    user32.SystemParametersInfoW(0x2000, 0, ctypes.byref(val), 0)  # SPI_GETFOREGROUNDLOCKTIMEOUT
+    if not val.value:
+        return True
+    if _fg_timeout is None:
+        _fg_timeout = val.value
+    ok = bool(user32.SystemParametersInfoW(0x2001, 0, ctypes.c_void_p(0), 2))  # 0 ms, SPIF_SENDCHANGE
+    log.log(logging.INFO if ok else logging.WARNING, f"Foreground lock timeout {val.value} ms -> 0: "
+            + ("done, keys now reach the game while you're in another window"
+               if ok else "refused by Windows (click the Auto E window, then Start)"))
+    return ok
+
+
+@atexit.register
+def restore_foreground():
+    global _fg_timeout
+    if _fg_timeout:
+        user32.SystemParametersInfoW(0x2001, 0, ctypes.c_void_p(_fg_timeout), 2)
+    _fg_timeout = None
+
+
 def focus_window(hwnd):
-    """SetForegroundWindow is refused to background apps; an empty input + sharing the foreground thread's
-    input state lifts that (same approach as PowerToys)."""
+    """Bring the game forward so a key actually lands in it. SetForegroundWindow is refused to background apps;
+    lifting the foreground lock, an empty input and sharing the foreground thread's input state all help, and
+    the shell's own SwitchToThisWindow is the last resort when the documented route is still refused."""
     if user32.GetForegroundWindow() == hwnd:
         return True
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    for _ in range(3):
-        user32.SendInput(1, ctypes.byref(INPUT(type=1)), ctypes.sizeof(INPUT))
+    for attempt in range(3):
+        # a key *up* for an unused key: enough to count as input from us, and nothing stays held down
+        user32.SendInput(1, ctypes.byref(INPUT(type=1, ki=KEYBDINPUT(0, 0, 0x2, 0, 0))), ctypes.sizeof(INPUT))
         fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
         me = ctypes.windll.kernel32.GetCurrentThreadId()
         attached = fg_thread and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True)
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
+        if attempt:
+            user32.SwitchToThisWindow(hwnd, True)  # undocumented, but it is what Alt+Tab itself uses
         if attached:
             user32.AttachThreadInput(me, fg_thread, False)
         for _ in range(10):
@@ -250,32 +332,70 @@ user32.FindWindowExW.argtypes = (wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR,
 user32.FindWindowExW.restype = wintypes.HWND
 
 
-def post_key(hwnd, ch, hold):
-    """Key down/up posted straight into a window's message queue, so it works while another window has focus.
-    Browsers and apps that read WM_KEYDOWN get it; games that only read raw input / DirectInput (FiveM) don't."""
-    vk = 0x20 if ch == "Space" else user32.VkKeyScanW(ord(ch.lower())) & 0xFF
-    scan = user32.MapVirtualKeyW(vk, 0)
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD), ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND), ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND), ("rcCaret", wintypes.RECT)]
+
+
+def message_target(hwnd):
+    """Where a posted key has to go. A top-level window usually hands its keyboard input to a child, so a
+    message posted to the frame is dropped: ask the window's own UI thread which child holds the focus, and
+    fall back to a browser's render widget, then to the frame itself."""
+    info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+    if tid and user32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndFocus:
+        return info.hwndFocus
     # Chrome / Edge / Electron take keyboard messages on their render widget child, not the top-level window
-    target = user32.FindWindowExW(hwnd, None, "Chrome_RenderWidgetHostHWND", None) or hwnd
+    return user32.FindWindowExW(hwnd, None, "Chrome_RenderWidgetHostHWND", None) or hwnd
+
+
+def post_key(hwnd, ch, hold):
+    """Key down/up posted straight into a window's message queue, so it lands while another window has focus
+    and even while this one is minimized. Anything reading window messages takes it -- browsers, most UI
+    toolkits, chat boxes. A game that reads only raw input or DirectInput (GTA V / FiveM) will not."""
+    vk = vk_of(ch)
+    scan = user32.MapVirtualKeyW(vk, 0)
+    target = message_target(hwnd)
     for msg, bits in ((0x100, 0), (0x101, 0xC0000000)):  # WM_KEYDOWN, WM_KEYUP (+ previous-state/transition bits)
-        if not user32.PostMessageW(target, msg, vk, wintypes.LPARAM(1 | scan << 16 | bits)):
+        lparam = wintypes.LPARAM(1 | scan << 16 | bits)
+        if not user32.PostMessageW(target, msg, vk, lparam):
             say_once("postmessage", logging.ERROR, f"PostMessage failed (error {ctypes.get_last_error()})", 10)
         if msg == 0x100:
+            if len(ch) == 1 and ch.isprintable():
+                user32.PostMessageW(target, 0x102, ord(ch), lparam)  # WM_CHAR: a text box needs the character
             time.sleep(hold)
 
 
-def press(letter, cfg, region, focus=None):
-    """Press the key into the game: in the background, or by bringing its window forward first.
-    Returns where the key went, or why it didn't."""
-    target = window_under(region)
-    if cfg["background"] and target and user32.GetForegroundWindow() != target:
-        post_key(target, letter, cfg["hold"] / 1000)
-        return f"{title_of(target)} (background)"
-    if cfg["focus_game"] if focus is None else focus:
-        if target and user32.GetForegroundWindow() != target:
-            if not focus_window(target):
-                return f"NOT PRESSED: couldn't focus '{title_of(target)}' (click the game once)"
-            time.sleep(0.15)  # a just-activated browser queues input; a press sent now arrives squashed to ~0ms
+def reach(cfg, region, target=None):
+    """Make the game window ready to take a key, *before* the press is timed. Focusing costs up to a few
+    hundred ms, so doing it at press time (as this used to) made every press that needed it land late."""
+    if not (target and user32.IsWindow(target)):
+        target = window_under(region)
+    if target and not cfg["background"] and user32.GetForegroundWindow() != target:
+        if focus_window(target):
+            time.sleep(0.15)  # a just-activated window queues input; a press sent now arrives squashed to ~0ms
+    return target
+
+
+def press(letter, cfg, region, target=None):
+    """Send the key to the game. A real key always goes to the foreground window, so if the game isn't in
+    front the key is brought to it rather than typed into whatever you alt-tabbed to -- that is how presses
+    ended up in this app's own window and in Discord. Returns where the key went, or why it didn't."""
+    if not (target and user32.IsWindow(target)):
+        target = window_under(region)
+    if target and user32.GetForegroundWindow() != target:
+        if cfg["background"]:
+            if user32.IsIconic(target):
+                say_once("iconic", logging.WARNING, "The game window is minimized. Windows stops it drawing, so "
+                         "the bar can't be read at all -- use windowed borderless and leave it on screen.", 60)
+            post_key(target, letter, cfg["hold"] / 1000)
+            return f"{title_of(target)} (background)"
+        if not focus_window(target) and user32.GetForegroundWindow() != target:
+            # refused (an elevated window has the foreground?): posting is better than sending it elsewhere,
+            # though a game reading only raw input won't take it
+            post_key(target, letter, cfg["hold"] / 1000)
+            return f"{title_of(target)} (background, couldn't focus it)"
     send_key(letter, cfg["hold"] / 1000)
     return title_of(user32.GetForegroundWindow())
 
@@ -287,6 +407,7 @@ class Watcher(threading.Thread):
     def __init__(self, cfg):
         super().__init__(daemon=True, name="watcher")
         self.cfg, self.mode, self.armed = cfg, "skill", False
+        self.target = None  # game window locked in at start: alt-tabbing can't redirect keys to another window
         self.frame = self.raw = self.mask = self.last_line = None
         self.mask_at, self.line_seen, self.last_speed = (0, 0), 0.0, 0
         self.vel, self.frame_dt, self.captured = 0.0, 1 / 60, 0.0
@@ -299,8 +420,10 @@ class Watcher(threading.Thread):
         self.templates, self.digits = None, None
         self.last_press, self.last_miss, self.misses, self.last_sent = (0.0, None), 0.0, 0, 0.0
         self.jobs = queue.Queue()
+        self.last_jiggle = time.time()
         self.reset_round()
         threading.Thread(target=self.press_loop, daemon=True, name="presser").start()
+        threading.Thread(target=self.jiggle_loop, daemon=True, name="jiggler").start()
 
     def reset_round(self):
         self.box_x = self.done = self.pending = self.sig = self.clean_box = self.pressed_x = None
@@ -316,22 +439,26 @@ class Watcher(threading.Thread):
         self.log.appendleft(f"{time.strftime('%H:%M:%S')}  MISSED  {text}")
         log.warning(f"Missed: {text}")
 
-    def queue_press(self, letter, region, why, focus=None, wait=0.0):
+    def queue_press(self, letter, region, why, wait=0.0):
         """Presses run on their own thread so holding a key never pauses detection. The key is sent `wait` s from
         now: the exact moment the line reaches the target, finer than one check."""
         self.last_press = (time.time(), letter)  # for the cooldown; counted as pressed only once really sent
-        self.jobs.put((letter, dict(region), why, focus, time.perf_counter() + wait))
+        self.jobs.put((letter, dict(region), why, time.perf_counter() + wait))
 
     def press_loop(self):
         while True:
-            letter, region, why, focus, at = self.jobs.get()
+            letter, region, why, at = self.jobs.get()
             cfg = self.cfg
+            if why in ("pressed", "retry") and not self.armed:
+                continue  # stopped watching between aiming and sending: never fire into a chat box
             try:
                 if why == "pressed":
                     at += cfg["delay"] / 1000
+                target = reach(cfg, region, self.target)  # before the wait: focusing is slow, aiming is not
                 while (left := at - time.perf_counter()) > 0:
                     time.sleep(left)  # Python 3.11+ sleeps to ~1 ms on Windows
-                where = "(dry run, no key sent)" if cfg["dev"] and cfg["dry_run"] else press(letter, cfg, region, focus)
+                where = ("(dry run, no key sent)" if cfg["dev"] and cfg["dry_run"]
+                         else press(letter, cfg, region, target))
             except Exception:
                 log.exception(f"Pressing {letter} failed")
                 self.missed(f"{why} {letter} -> failed, see the log")
@@ -345,6 +472,30 @@ class Watcher(threading.Thread):
                     self.presses[letter] += 1
                 self.log.appendleft(f"{time.strftime('%H:%M:%S')}  {text}")
                 log.info(text)
+
+    def jiggle_loop(self):
+        """Nudge the mouse every so often so an AFK kick doesn't see it sitting still. Guarded three ways: only
+        while running, only while the game is the window in front (otherwise it would drag the pointer around
+        whatever you are doing), and never while a bar is on screen, since in a game a mouse move turns the
+        camera and that changes the world behind a see-through bar mid-round."""
+        while True:
+            time.sleep(1)
+            cfg = self.cfg
+            if not (self.armed and cfg["jiggle"]):
+                self.last_jiggle = time.time()  # starting up shouldn't fire one straight away
+                continue
+            if time.time() - self.last_jiggle < max(10, cfg["jiggle_secs"]):
+                continue
+            if self.box_x is not None or not cursor_in(self.target):
+                continue
+            if self.target and not cfg["background"] and user32.GetForegroundWindow() != self.target:
+                continue  # focus mode: the game isn't in front, so a nudge would go to whatever is
+            self.last_jiggle = time.time()
+            dx, dy = random.choice(((7, 0), (-7, 0), (0, 6), (0, -6), (6, 5), (-6, -5)))
+            move_mouse(dx, dy)
+            time.sleep(0.12)
+            move_mouse(-dx, -dy)  # straight back, so the camera never drifts
+            log.debug(f"Mouse nudge {dx},{dy} and back")
 
     def run(self):
         frames, t_fps = 0, time.perf_counter()
@@ -434,7 +585,10 @@ class Watcher(threading.Thread):
                 if self.vel and (v > 0) == (self.vel > 0):
                     self.vel, self.steady = (self.vel + v) / 2, self.steady + 1  # px/s, smoothed against jitter
                 else:
-                    self.vel, self.steady = v, 0  # started or turned
+                    # one sighting-to-sighting jump is already movement. Waiting for a second agreeing sample
+                    # cost three checks before any press could be scheduled, and a fast line is past a letter
+                    # near the start of the bar by then.
+                    self.vel, self.steady = v, 1  # started or turned
             self.last_line, self.line_seen = line, now
         # skill bar: a white line touching the white letter becomes one blob, so the line "vanishes" and the
         # letter's shape is polluted. While that lasts, keep the last clean letter box and don't re-read.
@@ -499,9 +653,17 @@ class Watcher(threading.Thread):
             if est is not None and moving:
                 # where the line would be when a key sent right now lands: detection time so far + game input lag
                 land = est + self.vel * (time.time() - now + cfg["aim_ms"] / 1000)
-                wait = det.press_wait(land, self.vel, x0 + m, x1 - m, self.frame_dt)
+                # a zone only a few px wide is crossed between two checks, so waiting for a closer look
+                # means no press at all. Once the speed has held over several checks it is good enough to book
+                # the press from further out -- 60 ms of drift at a few % speed error is well under a pixel.
+                horizon = 0.06 if self.steady >= 2 else None
+                wait = det.press_wait(land, self.vel, x0 + m, x1 - m, self.frame_dt, horizon)
                 hit = wait is not None
-            elif not skill:  # a line that isn't moving: plain overlap
+            elif skill:
+                # no usable speed yet (the line just appeared, or restarted right on the letter): press on plain
+                # overlap. `inside` also covers the line and the letter merged into one white blob.
+                hit = inside
+            else:  # a line that isn't moving: plain overlap
                 hit = line is not None and x0 + m <= line <= x1 - m
             # the line went past the zone (or is gone / restarted): the next pass may press again
             if est is None:
@@ -561,6 +723,103 @@ class Watcher(threading.Thread):
         self.box, self.line, self.hit = box, line, hit
         self.raw, self.frame = img, view
         self.frame_id += 1
+
+
+# ---------- full auto ----------
+class FullAuto:
+    """Runs cfg["auto"] -- a list of steps -- on its own thread, so nothing here can stall detection. Each
+    step sends a key (or types a line) and then waits, either for the watcher to press the bar's key or for
+    a number of minutes. At the end of the list it starts over."""
+
+    def __init__(self, cfg, watcher):
+        self.cfg, self.w, self.on, self.stage, self.until = cfg, watcher, False, "", 0.0
+
+    def start(self):
+        region = self.cfg[self.w.mode]["region"]
+        if not region:
+            log.warning("Full auto: select a region first")
+            return False
+        self.w.target = window_under(region)
+        self.w.armed = self.on = True
+        log.info(f"Full auto started on '{title_of(self.w.target)}'" if self.w.target else "Full auto started")
+        threading.Thread(target=self.run, daemon=True, name="fullauto").start()
+        return True
+
+    def stop(self):
+        if self.on:
+            log.info("Full auto stopped")
+        self.on = self.w.armed = False
+        self.stage, self.w.target = "", None
+
+    def tap(self, *keys, gap=0.12):
+        """Scripted keys go through the same path as a bar press, so one rule covers every key this app sends:
+        with "press without focusing" on they are posted to the game and focus is never taken, otherwise the
+        game is brought to the front first."""
+        region = self.cfg[self.w.mode]["region"]
+        for k in keys:
+            if not self.on:
+                return False
+            log.info(f"Full auto: {k} -> {press(k, self.cfg, region, self.w.target)}")
+            time.sleep(gap)
+        return self.on
+
+    def hold(self, minutes, stage):
+        """Wait, but check often enough that Stop feels instant."""
+        self.stage, self.until = stage, time.time() + 60 * minutes
+        while self.on and time.time() < self.until:
+            time.sleep(0.2)
+        return self.on
+
+    def await_bar(self, timeout=120):
+        """Wait until the watcher really presses the bar's key; the rest of the cycle is timed from there."""
+        self.stage, self.until = "waiting for the bar", time.time() + timeout
+        mark = self.w.last_sent
+        while self.on and time.time() < self.until:
+            if self.w.last_sent != mark:
+                return True
+            time.sleep(0.05)
+        if self.on:
+            log.warning(f"Full auto: no key pressed within {timeout}s, carrying on anyway")
+        return False
+
+    def send(self, key):
+        """One named key (E, 1, Enter, Backspace, Space...) or, for anything longer, a line typed out and sent
+        with Enter -- which is what a chat command like "e yoga" needs."""
+        if key in VKS or len(key) == 1:
+            return self.tap(key)
+        time.sleep(0.4)  # a chat box needs a moment to open before it takes typing
+        return self.tap(*key, gap=0.05) and self.tap("Enter")
+
+    def wait_for(self, spec, key):
+        """"bar" waits for the watcher to press the bar's key, a number waits that many minutes, 0 doesn't wait."""
+        if str(spec).strip().lower() in ("bar", "key"):
+            self.stage = f"{key} -> waiting for the bar"
+            self.await_bar()
+            return self.on
+        try:
+            minutes = float(str(spec).strip() or 0)
+        except ValueError:
+            log.warning(f"Full auto: '{spec}' is not a wait, treating it as no wait")
+            minutes = 0.0
+        return self.hold(minutes, f"{key} -> waiting {minutes:g} min") if minutes > 0 else self.on
+
+    def run(self):
+        while self.on:
+            steps = [s for s in self.cfg["auto"] if s.get("on") and str(s.get("key", "")).strip()]
+            if not steps:
+                log.warning("Full auto: no steps are switched on")
+                break
+            for step in steps:
+                if not self.on:
+                    break
+                key = str(step["key"]).strip()
+                # watching drives the outline too, so a step that runs while nothing is on screen (an emote)
+                # takes the region off as well
+                self.w.armed = bool(step.get("watch", True))
+                self.stage = key
+                if not self.send(key) or not self.wait_for(step.get("wait", "0"), key):
+                    break
+        self.stage = ""
 
 
 # ---------- UI ----------
@@ -666,6 +925,7 @@ class App(tk.Tk):
         self.setup_style()
         self.watcher = Watcher(self.cfg)
         self.watcher.start()
+        self.auto = FullAuto(self.cfg, self.watcher)
         self.overlay = Overlay(self)
         self.views, self.vars, self.nav, self.pages, self._shown = {}, {}, {}, {}, {}
         self.picking, self.hotkey_down, self.scale, self.page = None, False, 1.0, None
@@ -692,7 +952,7 @@ class App(tk.Tk):
         body.pack(side="left", fill="both", expand=True)
 
         for name, build in [("Skill bar", self.page_skill), ("Custom", self.page_custom),
-                            ("Settings", self.page_settings),
+                            ("Full auto", self.page_auto), ("Settings", self.page_settings),
                             ("Stats", self.page_stats), ("Help", self.page_help), ("Developer", self.page_dev)]:
             page = tk.Frame(body, bg=BG)
             page.place(relwidth=1, relheight=1)
@@ -718,6 +978,7 @@ class App(tk.Tk):
 
         self.show("Skill bar")
         self.after(100, self.apply_window_settings)
+        self.after(400, unlock_foreground)  # our window has focus now, which is when Windows accepts it
         log.info(f"Auto E started (admin: {bool(ctypes.windll.shell32.IsUserAnAdmin())})")
         self.tick()
 
@@ -832,6 +1093,80 @@ class App(tk.Tk):
                        "For other bars. Select the region, then use Pick box color / Pick line color and "
                        "click that part in the live view.", extras)
 
+    def page_auto(self, page):
+        self.header(page, "Full auto", "Runs a cycle of key presses on its own, top to bottom then round "
+                                       "again, using the region of whichever mode you picked (Skill bar or "
+                                       "Custom). Start it with the game already open.")
+        row = self.card(page, fill="x")
+        Btn(row, "Select region", lambda: self.select_region(self.watcher.mode)).pack(side="left")
+        self.auto_region = tk.Label(row, bg=CARD, fg=MUTED, font=(FONT, 10))
+        self.auto_region.pack(side="left", padx=14)
+        self.auto_btn = Btn(row, "Start full auto", self.toggle_auto, "primary", width=16)
+        self.auto_btn.pack(side="right")
+
+        table = self.card(page, fill="x", pady=14)
+        for i, (name, width) in enumerate((("ON", 4), ("KEY OR TEXT TO TYPE", 26), ("THEN WAIT", 12),
+                                           ("WATCH REGION", 12))):
+            tk.Label(table, text=name, bg=CARD, fg=DIM, font=(FONT, 8, "bold"), width=width, anchor="w").grid(
+                row=0, column=i, sticky="w", padx=(0, 16), pady=(0, 6))
+        self.step_vars = []
+        for i, step in enumerate(self.cfg["auto"]):
+            on = tk.BooleanVar(value=bool(step.get("on")))
+            key = tk.StringVar(value=str(step.get("key", "")))
+            wait = tk.StringVar(value=str(step.get("wait", "0")))
+            watch = tk.BooleanVar(value=bool(step.get("watch", True)))
+            Toggle(table, on).grid(row=i + 1, column=0, sticky="w", pady=2)
+            for col, (var, width) in enumerate(((key, 24), (wait, 8)), start=1):
+                tk.Entry(table, textvariable=var, width=width, bg=FIELD, fg=TEXT, insertbackground=TEXT,
+                         relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+                         highlightcolor=ACCENT, font=(FONT, 10)).grid(row=i + 1, column=col, sticky="w",
+                                                                      padx=(0, 16), ipady=4)
+            Toggle(table, watch).grid(row=i + 1, column=3, sticky="w", pady=2)
+            for v in (on, key, wait, watch):
+                v.trace_add("write", self.save_steps)
+            self.step_vars.append((on, key, wait, watch))
+
+        tk.Label(page, bg=BG, fg=MUTED, justify="left", font=(FONT, 9), wraplength=int(720 * self.s), text=(
+            "Key or text:  one key (E, 1, X, Space, Enter, Backspace, Esc, Tab), or a whole line like "
+            "e yoga, which is typed out and sent with Enter.\n"
+            "Then wait:  bar waits until the bar's key has been pressed, a number waits that many minutes, "
+            "0 goes straight on to the next step.\n"
+            "Watch region:  off for a step that runs while no bar is on screen, such as an emote -- nothing "
+            "is pressed and the outline goes away until a step with it back on.\n"
+            "Switch a step off to skip it: turning off the emote's rows leaves the cycle at E, the bar's key "
+            "and 1.")).pack(anchor="w")
+        self.auto_lbl = tk.Label(page, bg=BG, fg=MUTED, font=(FONT, 13, "bold"), anchor="w")
+        self.auto_lbl.pack(fill="x", pady=(12, 0))
+
+    def save_steps(self, *_):
+        try:
+            self.cfg["auto"] = [{"on": o.get(), "key": k.get(), "wait": w.get(), "watch": c.get()}
+                                for o, k, w, c in self.step_vars]
+        except tk.TclError:
+            return  # half-typed value
+        save_config(self.cfg)
+
+    def toggle_auto(self):
+        if self.auto.on:
+            self.auto.stop()
+            self.overlay.withdraw()
+            if self.auto_hidden:
+                self.auto_hidden = False
+                self.deiconify()
+            return
+        unlock_foreground()
+        if not self.auto.start():
+            self.show(PAGE_OF_MODE[self.watcher.mode])
+            return
+        if self.cfg["outline"]:
+            self.overlay.show_on(self.cfg[self.watcher.mode]["region"])
+        if self.cfg["minimize"]:
+            self.auto_hidden = True
+            self.hide_main()
+            self.update()
+        if self.auto.w.target:
+            focus_window(self.auto.w.target)  # minimizing hands focus to "the next window", possibly our outline
+
     def setting_rows(self, parent, rows):
         for i, (key, label, kind, hint) in enumerate(rows):
             tk.Label(parent, text=label, bg=CARD, fg=TEXT, font=(FONT, 10)).grid(
@@ -867,11 +1202,16 @@ class App(tk.Tk):
                  "Press when = Letter appears: presses again if the letter is still showing after the wait below. 0 = off."),
                 ("retry_ms", "Re-press wait (ms)", (80, 2000),
                  "Press when = Letter appears: how long before pressing again."),
+                ("jiggle", "Move the mouse now and then", "switch",
+                 "Servers that kick you for being AFK watch the mouse. Nudges it a few pixels and straight "
+                 "back, only while running, only while the game is in front and never while a bar is up."),
+                ("jiggle_secs", "Seconds between mouse nudges", (10, 600),
+                 "Keep it well under the server's AFK timeout."),
                 ("background", "Press without focusing the game", "switch",
-                 "Sends the key straight to the game window, so you can use other windows. Games that ignore "
-                 "it (raw input, e.g. FiveM): turn this off."),
-                ("focus_game", "Focus game before pressing", "switch",
-                 "Background off: brings the window under the area to the front so it gets the key."),
+                 "On: keys are posted to the game window and focus is never taken, so your mouse stays free "
+                 "on another screen. Only works if the game reads window messages -- GTA V / FiveM read raw "
+                 "input and ignore them. Off: the game is brought to the front for each key, which works "
+                 "everywhere but grabs the pointer."),
             ],
             "Reading": [
                 ("min_conf", "Min letter match %", (50, 99), "Won't press if the letter read is less sure than this."),
@@ -927,6 +1267,21 @@ class App(tk.Tk):
             "Game not focused?  Keep Press without focusing the game on: keys go straight to the game window "
             "while you use other windows. The bar must stay visible on screen (not minimized or covered). "
             "If a game ignores background keys, turn it off so the game is brought to the front instead.\n"
+            "Full auto  runs a cycle of key presses for you, over and over: by default E, the bar\'s key, 1, "
+            "five minutes, T, \"e yoga\", Enter, ten minutes, X, and round again. Every step is yours to "
+            "change on that page -- which key, how long to wait after it, whether the region is watched during "
+            "that wait, and whether the step runs at all. The hotkey stops it.\n"
+            "Kicked for being AFK?  Move the mouse now and then, in Settings, nudges the pointer a few pixels "
+            "and back every couple of minutes so the server sees mouse input. It only does it while running, "
+            "while the game is the window in front, and never while a bar is up.\n"
+            "Two screens, and you want your mouse free?  Run the game windowed borderless and turn on Press "
+            "without focusing the game. Keys are then posted to the game window, focus is never taken and the "
+            "pointer is never grabbed. The catch is that GTA V / FiveM read raw input and ignore posted keys, so "
+            "for those the switch has to stay off and the game is pulled to the front for each key. Moving the "
+            "mouse to the other screen does not cost you focus by itself -- only clicking there does.\n"
+            "Minimized game?  Windows stops a minimized window drawing, so there is nothing on screen to read "
+            "and no bar to time against. Exclusive fullscreen minimizes the game whenever you alt-tab, which is "
+            "why windowed borderless is the one to use; plain windowed works just as well.\n"
             "Too early / too late?  Change Trigger zone margin or Press delay in Settings.\n"
             "Keys not reaching the game?  Click Test key: it focuses the game and presses the letter, and "
             "Stats shows which window got it. Click inside the game once first (browser games need the "
@@ -1149,6 +1504,8 @@ class App(tk.Tk):
         self.withdraw() if self.cfg["hide_taskbar"] else self.iconify()
 
     def toggle(self):
+        if self.auto.on:
+            return self.toggle_auto()
         w = self.watcher
         region = self.cfg[w.mode]["region"]
         if not region:
@@ -1157,7 +1514,11 @@ class App(tk.Tk):
             log.warning("Can't start: no region selected")
             return
         w.armed = not w.armed
-        log.info(f"{'Started' if w.armed else 'Stopped'} ({w.mode})")
+        if w.armed:
+            unlock_foreground()
+        w.target = window_under(region) if w.armed else None
+        log.info(f"{'Started' if w.armed else 'Stopped'} ({w.mode})"
+                 + (f" on '{title_of(w.target)}'" if w.target else ""))
         if not w.armed:
             self.overlay.withdraw()
             if self.auto_hidden:
@@ -1168,7 +1529,7 @@ class App(tk.Tk):
             self.overlay.show_on(region)
         # hand the keyboard to the game: easiest while this app is still the foreground window
         # (background mode never needs focus, so it leaves whatever window you're using alone)
-        focus = self.cfg["focus_game"] and not self.cfg["background"]
+        focus = not self.cfg["background"]
         target = window_under(region) if focus and is_ours(user32.GetForegroundWindow()) else None
         if target and not focus_window(target):
             log.warning(f"Couldn't focus '{title_of(target)}', click the game once")
@@ -1186,7 +1547,7 @@ class App(tk.Tk):
             log.warning("Test key: no region selected")
             return
         key = self.cfg[mode].get("key", "Auto")
-        self.watcher.queue_press(key if key != "Auto" else self.watcher.letter or "E", region, "TEST", focus=True)
+        self.watcher.queue_press(key if key != "Auto" else self.watcher.letter or "E", region, "TEST")
         self.show("Stats")
 
     def apply_window_settings(self, refresh_taskbar=False):
@@ -1359,6 +1720,16 @@ class App(tk.Tk):
                     self._shown.pop(str(pv), None)
                 else:
                     photo.paste(im)  # reuse the Tk image instead of allocating a new one every frame
+
+        elif self.page == "Full auto":
+            a = self.auto
+            left = max(0.0, a.until - time.time()) if a.on else 0.0
+            self.set(self.auto_btn, text="Stop full auto" if a.on else "Start full auto")
+            self.set(self.auto_region, text=f"{region['width']}×{region['height']} at ({region['left']}, "
+                                            f"{region['top']})" if region else "No region selected")
+            self.set(self.auto_lbl, text=f"{'RUNNING' if a.on else 'Idle'}  ·  {a.stage or '—'}"
+                     + (f"  ·  {int(left) // 60}:{int(left) % 60:02d} left" if left else ""),
+                     foreground=GREEN if a.on else MUTED)
 
         elif self.page == "Stats":
             self.set(self.stat_lbls["Pressed"], text=str(sum(w.presses.values())))
